@@ -1014,7 +1014,23 @@ const readStun = async (rd, buf) => {
         return [parseStun(b.subarray(0, n)), total > n ? b.subarray(n) : null];
     } catch {return null}
 };
+const readStunTimeout = async (rd, buf = null, timeoutMs = 5000) => {
+    let timer;
+    try {
+        return await Promise.race([
+            readStun(rd, buf),
+            new Promise((_, reject) => {
+                timer = setTimeout(() => {
+                    try {rd.cancel?.()} catch {}
+                    reject(0);
+                }, timeoutMs);
+            })
+        ]);
+    } catch {return null}
+    finally {if (timer) clearTimeout(timer)}
+};
 const md5 = async s => new Uint8Array(await crypto.subtle.digest('MD5', textEncoder.encode(s)));
+// TURN TCP relay（仅 IPv4 目标；含保活 / Stale Nonce 重协商）
 const connectViaTurnProxy = async ({hostname, port, username, password}, {addrType, port: targetPort, addrBytes, isHttp}, useTls = false) => {
     let targetIp = binaryAddrToString(addrType, addrBytes);
     if (isHttp) addrType = addrTypeIs(targetIp);
@@ -1025,9 +1041,14 @@ const connectViaTurnProxy = async ({hostname, port, username, password}, {addrTy
     } else if (addrType === 4) {return null}
     let ctrl = null, data = null, dataPromise = null, ctrlTls = null, dataTls = null;
     let cw = null, cr = null, ctrlExtra = null, closed = false;
+    let keepAliveTimer = null, keepAliveResolver = null;
+    let cryptoKey = null, aa = [], currentLifetimeSec = 300;
     const proxyIsIp = addrTypeIs(hostname) !== 3;
     const close = () => {
+        if (closed) return;
         closed = true;
+        if (keepAliveTimer) {clearTimeout(keepAliveTimer); keepAliveTimer = null}
+        if (keepAliveResolver) {keepAliveResolver(); keepAliveResolver = null}
         [ctrl, data, ctrlTls, dataTls].forEach(s => {try {s?.close()} catch {}});
         [cr, cw].forEach(lock => {try {lock?.releaseLock()} catch {}});
     };
@@ -1093,8 +1114,40 @@ const connectViaTurnProxy = async ({hostname, port, username, password}, {addrTy
         ctrlExtra = extra;
         return msg;
     };
-    let cryptoKey = null, aa = [];
-    const sign = m => cryptoKey ? addIntegrity(m, cryptoKey) : m;
+    const sign = async m => cryptoKey ? addIntegrity(m, cryptoKey) : m;
+    const updateAuth = async (attrs) => {
+        const realm = textDecoder.decode(attrs[0x014] ?? new Uint8Array(0));
+        const nonce = attrs[0x015] ?? new Uint8Array(0);
+        if (!nonce?.length || !username) return false;
+        const keyBytes = await md5(`${username}:${realm}:${password || ''}`);
+        cryptoKey = await crypto.subtle.importKey('raw', keyBytes, {name: 'HMAC', hash: 'SHA-1'}, false, ['sign']);
+        aa = [
+            stunAttr(0x006, textEncoder.encode(username)),
+            stunAttr(0x014, textEncoder.encode(realm)),
+            stunAttr(0x015, nonce)
+        ];
+        return true;
+    };
+    const getLife = r => r?.attrs?.[0x000D]?.length >= 4
+        ? Math.min(3600, (r.attrs[0x000D][0] << 24 | r.attrs[0x000D][1] << 16 | r.attrs[0x000D][2] << 8 | r.attrs[0x000D][3]) >>> 0)
+        : currentLifetimeSec;
+    // 控制通道顺序收发：写一个请求、读一个响应（带超时），响应天然有序，无需 TID 匹配
+    const roundTrip = async (msgType, attrs, expectedTypes, timeoutMs = 5000) => {
+        const msg = await sign(stunMsg(msgType, newTid(), attrs));
+        await cw.write(msg);
+        const result = await readStunTimeout(cr, ctrlExtra, timeoutMs);
+        if (!result) throw 0;
+        const [res, leftover] = result;
+        ctrlExtra = leftover;
+        if (!res) throw 0;
+        if ((res.type & 0x0110) === 0x0110) {
+            const errCode = parseErr(res.attrs[0x009]);
+            if (errCode === 401 || errCode === 438 || errCode === 437) throw {isAuthError: true, attrs: res.attrs, errCode};
+            throw 0;
+        }
+        if (!expectedTypes.includes(res.type)) throw 0;
+        return res;
+    };
     try {
         const ctrlPromise = createConn();
         dataPromise = createConn().then(res => {
@@ -1117,8 +1170,10 @@ const connectViaTurnProxy = async ({hostname, port, username, password}, {addrTy
                 const v = await ctrlTls.read();
                 return v ? {value: v, done: false} : {done: true};
             },
+            cancel: async () => {try {await ctrlTls.close()} catch {}},
             releaseLock: () => {}
         } : ctrl.readable.getReader();
+        // 建连：先发未认证 Allocate 探测；401 则带 auth 一次性批量写出 Allocate+CreatePermission+Connect，省 2 个 RTT
         let tid = newTid();
         await cw.write(stunMsg(0x003, tid, [stunAttr(0x019, new Uint8Array([6, 0, 0, 0]))]));
         let r = await readControl(tid);
@@ -1126,31 +1181,30 @@ const connectViaTurnProxy = async ({hostname, port, username, password}, {addrTy
         const targetAddress = await targetIp;
         if (!targetAddress) throw new Error();
         const peer = stunAttr(0x012, xorPeer(targetAddress, targetPort));
-        let permissionTid = null, connectTid = null, pm = null, cm = null;
+        let permissionTid = null, connectTid = null;
         if (r.type === 0x113 && username && parseErr(r.attrs[0x009]) === 401) {
-            const realm = textDecoder.decode(r.attrs[0x014] ?? []), nonce = r.attrs[0x015] ?? [];
-            const keyBytes = await md5(`${username}:${realm}:${password}`);
-            cryptoKey = await crypto.subtle.importKey('raw', keyBytes, {name: 'HMAC', hash: 'SHA-1'}, false, ['sign']);
-            aa = [stunAttr(0x006, textEncoder.encode(username)), stunAttr(0x014, textEncoder.encode(realm)), stunAttr(0x015, nonce)];
+            if (!(await updateAuth(r.attrs))) throw new Error();
             const allocateTid = newTid();
-            permissionTid = newTid(), connectTid = newTid();
-            const [am, permissionMsg, connectMsg] = await Promise.all([
+            permissionTid = newTid();
+            connectTid = newTid();
+            const [am, pm, cm] = await Promise.all([
                 sign(stunMsg(0x003, allocateTid, [stunAttr(0x019, new Uint8Array([6, 0, 0, 0])), ...aa])),
                 sign(stunMsg(0x008, permissionTid, [peer, ...aa])),
                 sign(stunMsg(0x00A, connectTid, [peer, ...aa]))
             ]);
-            pm = permissionMsg, cm = connectMsg;
             await cw.write(cat(am, pm, cm));
             r = await readControl(allocateTid);
         } else if (r.type === 0x103) {
-            permissionTid = newTid(), connectTid = newTid();
-            [pm, cm] = await Promise.all([
+            permissionTid = newTid();
+            connectTid = newTid();
+            const [pm, cm] = await Promise.all([
                 sign(stunMsg(0x008, permissionTid, [peer, ...aa])),
                 sign(stunMsg(0x00A, connectTid, [peer, ...aa]))
             ]);
             await cw.write(cat(pm, cm));
         } else {throw new Error()}
         if (r?.type !== 0x103) throw new Error();
+        currentLifetimeSec = getLife(r);
         r = await readControl(permissionTid);
         if (r?.type !== 0x108) throw new Error();
         r = await readControl(connectTid);
@@ -1171,6 +1225,45 @@ const connectViaTurnProxy = async ({hostname, port, username, password}, {addrTy
         [r, extra] = await readMatching(dr, tid);
         if (r?.type !== 0x10B) throw new Error();
         if (!dIsCustom) dr.releaseLock(), dw.releaseLock();
+        // 保活：按 nextAlloc / nextPerm 精确 sleep；无 BI；一次关键失败即拆除；支持 Stale Nonce 重协商
+        (async () => {
+            let lastAllocAt = Date.now(), lastPermAt = Date.now();
+            while (!closed) {
+                const now = Date.now();
+                const allocRef = Math.max(currentLifetimeSec * 0.8 * 1000, 30000);
+                const nextAlloc = lastAllocAt + allocRef;
+                const nextPerm = lastPermAt + 220000;
+                const wait = Math.max(1000, Math.min(nextAlloc, nextPerm) - now);
+                await new Promise(resolve => {
+                    keepAliveResolver = resolve;
+                    keepAliveTimer = setTimeout(resolve, wait);
+                });
+                keepAliveResolver = null;
+                keepAliveTimer = null;
+                if (closed) break;
+                const t = Date.now();
+                try {
+                    if (t - lastAllocAt >= allocRef) {
+                        // Refresh Request 0x004 → Refresh Success 0x104
+                        const res = await roundTrip(0x004, [...aa], [0x104]);
+                        currentLifetimeSec = getLife(res);
+                        lastAllocAt = Date.now();
+                    }
+                    if (t - lastPermAt >= 220000) {
+                        // CreatePermission 0x008 → Success 0x108
+                        await roundTrip(0x008, [peer, ...aa], [0x108]);
+                        lastPermAt = Date.now();
+                    }
+                } catch (e) {
+                    if (e?.isAuthError && e.errCode === 437) break;
+                    if (e?.isAuthError && e.errCode === 438) {
+                        if (await updateAuth(e.attrs)) continue;
+                    }
+                    break;
+                }
+            }
+            close();
+        })();
         const tlsStream = dIsCustom ? tlsStreamAdapter(dataTls) : null;
         const readable = tlsStream ? tlsStream.readable : data.readable;
         const writable = tlsStream ? tlsStream.writable : data.writable;
